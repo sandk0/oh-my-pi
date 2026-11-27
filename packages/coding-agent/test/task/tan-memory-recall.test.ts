@@ -4,6 +4,7 @@
  * the work added to its own transcript.
  */
 import { afterEach, expect, it, vi } from "bun:test";
+import type { Context } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -30,14 +31,20 @@ afterEach(() => {
 	AgentRegistry.resetGlobalForTests();
 });
 
-async function createParent(dir: TempDir, authStorage: AuthStorage, settings: Settings): Promise<AgentSession> {
+async function createParent(
+	dir: TempDir,
+	authStorage: AuthStorage,
+	settings: Settings,
+	activeModel = model,
+	sessionManager = SessionManager.create(dir.path(), dir.join("parent")),
+): Promise<AgentSession> {
 	const { session } = await sdk.createAgentSession({
 		cwd: dir.path(),
 		agentDir: dir.path(),
 		authStorage,
-		model,
+		model: activeModel,
 		settings,
-		sessionManager: SessionManager.create(dir.path(), dir.join("parent")),
+		sessionManager,
 		toolNames: [],
 		disableExtensionDiscovery: true,
 		skills: [],
@@ -50,13 +57,15 @@ async function createParent(dir: TempDir, authStorage: AuthStorage, settings: Se
 	return session;
 }
 
-async function runTan(parent: AgentSession, work: string, onClone: () => Promise<void>) {
-	const realCreate = sdk.createAgentSession;
-	vi.spyOn(sdk, "createAgentSession").mockImplementation(async options => {
-		const created = await realCreate(options);
-		await onClone();
-		return created;
-	});
+async function runTan(parent: AgentSession, work: string, onClone?: () => Promise<void>) {
+	if (onClone) {
+		const realCreate = sdk.createAgentSession;
+		vi.spyOn(sdk, "createAgentSession").mockImplementation(async options => {
+			const created = await realCreate(options);
+			await onClone();
+			return created;
+		});
+	}
 	const manager = parent.asyncJobManager;
 	if (!manager) throw new Error("Missing async job manager");
 	let runJob: (() => Promise<unknown>) | undefined;
@@ -87,11 +96,13 @@ async function runTan(parent: AgentSession, work: string, onClone: () => Promise
 	await runJob();
 }
 
-it("sends the parent's recalled system prompt unchanged from a /tan clone", async () => {
+it.each(["unchanged", "forgotten"])("sends the inherited recall from a /tan clone (%s memory)", async change => {
 	using dir = TempDir.createSync("@omp-tan-memory-recall-");
 	const auth = await AuthStorage.create(dir.join("auth.db"));
 	auth.keys.setRuntime("muse-code", "test-key");
-	const systemPrompts: string[][] = [];
+	auth.keys.setRuntime("antigravity-cli", "test-key");
+	auth.keys.setRuntime("google", "test-key");
+	const requests: Context[] = [];
 	const mock = createMockModel({ handler: { content: [{ type: "text", text: "alpha-7" }] } });
 	const realStreamFactory = settingsStream.createSettingsAwareStreamFn;
 	vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Network is disabled in this test"));
@@ -99,14 +110,14 @@ it("sends the parent's recalled system prompt unchanged from a /tan clone", asyn
 		realStreamFactory(
 			settings,
 			(streamModel, context, options) => {
-				systemPrompts.push([...(context.systemPrompt ?? [])]);
+				requests.push(context);
 				return mock.stream(streamModel, context, options);
 			},
 			slow,
 		),
 	);
-	// Sessions start Mnemopi in the background: [parent, clone] settle as each start finishes.
-	const mnemopiStarts = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+	// Wait for each background memory start before driving the corresponding session.
+	const mnemopiStarts = Array.from({ length: 3 }, () => Promise.withResolvers<void>());
 	const realStart = mnemopiBackend.start;
 	const pendingStarts = [...mnemopiStarts];
 	vi.spyOn(mnemopiBackend, "start").mockImplementation(async options => {
@@ -127,19 +138,52 @@ it("sends the parent's recalled system prompt unchanged from a /tan clone", asyn
 		"mnemopi.recallRelevance": "off",
 	});
 	try {
-		const parent = await createParent(dir, auth, settings);
+		let parent = await createParent(dir, auth, settings);
 		try {
 			await mnemopiStarts[0]!.promise;
-			getMnemopiSessionState(parent)!.rememberScoped(MEMORY);
+			const state = getMnemopiSessionState(parent)!;
+			const id = state.rememberScoped(MEMORY);
 			await parent.prompt("Where is the deploy host?");
-			await parent.prompt("And which host serves staging?");
-			const parentPrompt = systemPrompts.at(-1)!;
+			const work = "Check the deploy host";
+			if (change === "forgotten") {
+				expect(state.editScopedMemory("forget", id).status).toBe("deleted");
+				const sessionFile = parent.sessionManager.getSessionFile()!;
+				await parent.dispose();
+				parent = await createParent(
+					dir,
+					auth,
+					settings,
+					getBundledModel("antigravity-cli", "gemini-4-hydrogen"),
+					await SessionManager.open(sessionFile, dir.join("parent")),
+				);
+				await mnemopiStarts[1]!.promise;
+				await parent.prompt("And which host serves staging?");
+				expect(requests.at(-1)?.systemPrompt?.join("\n")).not.toContain(MEMORY);
+				await parent.setModel(getBundledModel("google", "gemini-3-pro-preview"));
+			} else {
+				await parent.prompt("And which host serves staging?");
+			}
+			const parentPrompt = parent.systemPrompt;
 			expect(parentPrompt.join("\n").split(MEMORY)).toHaveLength(2);
 
-			const requestsBeforeClone = systemPrompts.length;
-			await runTan(parent, "Check the deploy host", () => mnemopiStarts[1]!.promise);
-			const clonePrompt = systemPrompts[requestsBeforeClone];
-			expect(clonePrompt).toEqual(parentPrompt);
+			const cloneRequestIndex = requests.length;
+			await runTan(parent, work);
+			const cloneRequest = requests
+				.slice(cloneRequestIndex)
+				.find(request =>
+					request.messages.some(
+						message => message.role === "user" && JSON.stringify(message.content).includes(work),
+					),
+				);
+			expect(cloneRequest?.systemPrompt).toEqual(parentPrompt);
+			if (change === "forgotten") {
+				const expected = `No longer in memory (deleted, invalidated, or expired): ${MEMORY}`;
+				const cloneMessages = cloneRequest?.messages.filter(message => message.role === "developer");
+				expect(JSON.stringify(cloneMessages)).toContain(expected);
+				await parent.prompt("Recheck the deploy host");
+				const parentMessages = requests.at(-1)?.messages.filter(message => message.role === "developer");
+				expect(JSON.stringify(parentMessages)).toContain(expected);
+			}
 		} finally {
 			await parent.dispose();
 		}

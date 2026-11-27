@@ -147,6 +147,7 @@
 - Dictation now warns once when the speech model cannot load on the GPU (e.g. out of VRAM) and falls back to CPU, naming the fallback device and the reason ([#11040](https://github.com/can1357/oh-my-pi/issues/11040))
 - Fixed `wait` guidance sending agents to ask the user to check back later on an outside condition (a CI run, a deploy): the tool description and the back-to-back wait reminder now name one async `bash` watcher that exits once the condition holds, then ending the turn or calling `wait`, and limit the `sleep` job rule to sleeping just to keep calling `wait` ([#18900](https://github.com/can1357/oh-my-pi/issues/18900))
 - RPC mode now writes a `notice` frame with `source: "session-model-restore"` before exiting when a startup `--continue`/`--resume` cannot restore the saved model, so hosts can tell the fail-closed exit from a crash and rebind via `open_session`/`switch_session` with an explicit model ([#17611](https://github.com/can1357/oh-my-pi/issues/17611))
+- Mitigate reported Antigravity CLI 429s associated with prompt content: use a neutral built-in opening, keep tool descriptions in schemas in `auto` mode, and omit automatic first-turn Mnemopi recall from the provider's system prompt. Manual memory lookup and retention are unchanged ([#20637](https://github.com/can1357/oh-my-pi/pull/20637) by [@sandk0](https://github.com/sandk0))
 
 ### Removed
 

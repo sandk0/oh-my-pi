@@ -1,5 +1,6 @@
 import { dirname } from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { allowsAutomaticMnemopiRecall } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import type * as MnemopiNs from "@oh-my-pi/pi-mnemopi";
 import type {
 	MemoryFacadeStats,
@@ -281,6 +282,11 @@ export function setMnemopiSessionState(
 	return previous;
 }
 
+export interface MnemopiRecallSnapshot {
+	readonly lastRecallSnippet?: string;
+	readonly pendingRecallChanges?: readonly RecalledMemory[];
+}
+
 export interface MnemopiSessionStateOptions {
 	sessionId: string;
 	config: MnemopiBackendConfig;
@@ -288,6 +294,7 @@ export interface MnemopiSessionStateOptions {
 	aliasOf?: MnemopiSessionStateApi;
 	lastRetainedTurn?: number;
 	hasRecalledForFirstTurn?: boolean;
+	initialRecall?: MnemopiRecallSnapshot;
 	/** Override the judge-role chain that `mnemopi.recallRelevance` consults. */
 	automaticRecallJudge?: Pick<ChainJudge, "withCandidate">;
 }
@@ -336,6 +343,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 	unsubscribe?: () => void;
 	#retentionCursorLoaded = false;
 	#recallGeneration = 0;
+	#pendingRecallChanges?: readonly RecalledMemory[];
 	readonly #automaticRecallJudge?: Pick<ChainJudge, "withCandidate">;
 
 	constructor(options: MnemopiSessionStateOptions) {
@@ -345,13 +353,27 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		this.aliasOf = options.aliasOf;
 		this.#automaticRecallJudge = options.automaticRecallJudge;
 		this.lastRetainedTurn = options.lastRetainedTurn ?? 0;
-		this.hasRecalledForFirstTurn = options.hasRecalledForFirstTurn ?? false;
+		const initialRecall = options.initialRecall;
+		this.hasRecalledForFirstTurn = initialRecall !== undefined || (options.hasRecalledForFirstTurn ?? false);
+		this.lastRecallSnippet = initialRecall?.lastRecallSnippet;
+		if (initialRecall?.pendingRecallChanges) {
+			// The forked history may already contain a notice the parent sent after dispatch.
+			const persisted = findPersistedRecall(this.session.sessionManager, getMnemopiRecallScope(this.config));
+			const pending = persisted?.memories ?? initialRecall.pendingRecallChanges;
+			if (pending.length > 0) this.#pendingRecallChanges = pending;
+		}
 		const parent = options.aliasOf;
 		this.#scoped = parent
 			? parent instanceof MnemopiSessionState
 				? parent.#scoped
 				: undefined
 			: createScopedResources(options.config);
+	}
+
+	/** Captures the recall state that belongs to the copied prompt, without consuming it. */
+	snapshotRecall(): MnemopiRecallSnapshot | undefined {
+		if (!this.hasRecalledForFirstTurn) return undefined;
+		return { lastRecallSnippet: this.lastRecallSnippet, pendingRecallChanges: this.#pendingRecallChanges };
 	}
 
 	/** Retain-bank store; only on the thread that owns the banks. */
@@ -399,6 +421,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		this.#retentionCursorLoaded = false;
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
+		this.#pendingRecallChanges = undefined;
 	}
 
 	getScopedRecallTargets(): readonly MnemopiScopedMemory[] {
@@ -780,11 +803,10 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 	}
 
 	/**
-	 * Compares a reused recall's memories with the live store as the recall block would
-	 * show them now. Returns the model-facing note about what changed since the model last
-	 * heard, and the memories still current, or undefined when nothing changed.
+	 * Compares a reused recall with the live store. The notice carries both the changes shown
+	 * to the model and the current memories, so a later resume does not generate a duplicate notice.
 	 */
-	#recallChanges(memories: readonly RecalledMemory[]): { content: string; memories: RecalledMemory[] } | undefined {
+	#recallChangeNotice(memories: readonly RecalledMemory[], scope: string): MemoryPromptPreparation["notice"] {
 		const { clipRecallContent } = requireMnemopi();
 		const removed: string[] = [];
 		const updated: Array<{ before: string; after: string }> = [];
@@ -808,7 +830,25 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			updated.push({ before: quoteMemoryText(memory.text), after: quoteMemoryText(text) });
 		}
 		if (removed.length === 0 && updated.length === 0) return undefined;
-		return { content: prompt.render(memoryRecallChangesPrompt, { removed, updated }), memories: current };
+		return {
+			content: prompt.render(memoryRecallChangesPrompt, { removed, updated }),
+			details: { scope, memories: current } satisfies MemoryRecallChangesDetails,
+		};
+	}
+
+	/** Prepares a notice about changes to previously recalled memories without starting another lookup. */
+	preparePendingRecallNotice(): MemoryPromptPreparation | undefined {
+		const pending = this.#pendingRecallChanges;
+		if (!pending || !this.config.autoRecall || !allowsAutomaticMnemopiRecall(this.session.model)) return undefined;
+		const generation = ++this.#recallGeneration;
+		return {
+			notice: this.#recallChangeNotice(pending, getMnemopiRecallScope(this.config)),
+			commit: () => {
+				if (this.#recallGeneration !== generation) return false;
+				this.#pendingRecallChanges = undefined;
+				return true;
+			},
+		};
 	}
 
 	/**
@@ -821,10 +861,14 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		signal?: AbortSignal,
 		budget: (block: string) => string = block => this.budgetRecallBlock(block),
 	): Promise<MemoryPromptPreparation | undefined> {
-		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return undefined;
+		if (!this.config.autoRecall || (this.hasRecalledForFirstTurn && !this.#pendingRecallChanges)) return undefined;
 		const latestPrompt = promptText.trim();
 		if (!latestPrompt) return undefined;
+		if (this.hasRecalledForFirstTurn) return this.preparePendingRecallNotice();
 		const generation = ++this.#recallGeneration;
+		if (!allowsAutomaticMnemopiRecall(this.session.model)) {
+			return { commit: () => this.#commitSkippedRecall(generation) };
+		}
 		// The transcript's recall is history: a resumed session sends it unchanged, so the
 		// prompt cache still matches, and reports what changed since as a new message.
 		const scope = getMnemopiRecallScope(this.config);
@@ -832,13 +876,10 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		if (persisted !== undefined) {
 			// The note carries what it reports, so a turn that never delivers it leaves the
 			// change for the next resume to report.
-			const changes = this.#recallChanges(persisted.memories);
+			const notice = this.#recallChangeNotice(persisted.memories, scope);
 			return {
 				context: persisted.text || undefined,
-				notice: changes && {
-					content: changes.content,
-					details: { scope, memories: changes.memories } satisfies MemoryRecallChangesDetails,
-				},
+				notice,
 				commit: () => this.#commitRecall(generation, persisted.text, undefined),
 			};
 		}
@@ -871,6 +912,17 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		if (text) this.lastRecallSnippet = text;
 		if (record) persistRecall(this.session.sessionManager, getMnemopiRecallScope(this.config), record);
 		return true;
+	}
+
+	#commitSkippedRecall(generation: number): boolean {
+		const persisted = findPersistedRecall(this.session.sessionManager, getMnemopiRecallScope(this.config));
+		if (persisted !== undefined) {
+			if (!this.#commitRecall(generation, persisted.text, undefined)) return false;
+			if (persisted.memories.length > 0) this.#pendingRecallChanges = persisted.memories;
+			return true;
+		}
+		// Record an empty first-turn recall only when the transcript has no prior recall.
+		return this.#commitRecall(generation, "", { text: "", memories: [] });
 	}
 
 	async recallForCompaction(messages: AgentMessage[], signal?: AbortSignal): Promise<string | undefined> {
@@ -1013,6 +1065,10 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			);
 			const lastUser = messages.findLast(message => message.role === "user");
 			if (!lastUser) return;
+			if (!allowsAutomaticMnemopiRecall(this.session.model)) {
+				this.#commitSkippedRecall(generation);
+				return;
+			}
 			const truncated = withLoopPhase("mnemopi.recall", () => {
 				const query = composeRecallQuery(lastUser.content, messages, this.config.recallContextTurns);
 				return truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
@@ -1029,6 +1085,10 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 				});
 				return;
 			}
+		}
+		if (!allowsAutomaticMnemopiRecall(this.session.model)) {
+			this.#commitSkippedRecall(generation);
+			return;
 		}
 		// A claimed user turn or a transcript reset supersedes this background
 		// lookup. Do not consume its first recall or overwrite its prompt context.

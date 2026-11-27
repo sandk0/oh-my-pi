@@ -141,8 +141,7 @@ export class TanCommandController {
 			session.agent.promptCacheKey ?? (taskPromptCacheKey === undefined ? parentSessionId : undefined);
 		const thinkingLevel = session.configuredThinkingLevel();
 		const systemPrompt = [...session.systemPrompt];
-		// The copied prompt carries the parent's memory recall; the clone inherits it as delivered.
-		const parentMnemopiSessionState = session.getMnemopiSessionState?.();
+		const mnemopiRecallSnapshot = session.getMnemopiSessionState?.()?.snapshotRecall();
 		const toolNames = session.getEnabledToolNames();
 		const activeToolNames = session.getActiveToolNames();
 		const mountedToolNames = session.getMountedToolCommandNames();
@@ -267,7 +266,7 @@ export class TanCommandController {
 								preloadedExtensionPaths: parentExtensionPaths?.length ? [...parentExtensionPaths] : undefined,
 								extensionRoots: () => parentExtensionRoots,
 								localProtocolOptions,
-								parentMnemopiSessionState,
+								mnemopiRecallSnapshot,
 							});
 							clone = created.session;
 							await clone.setActiveToolPresentation(toolNames, mountedToolNames);

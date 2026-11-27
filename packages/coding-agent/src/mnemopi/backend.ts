@@ -1,6 +1,7 @@
 import { rm } from "node:fs/promises";
 import * as path from "node:path";
 import { type ApiKeyResolver, completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
+import { allowsAutomaticMnemopiRecall } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { Mnemopi } from "@oh-my-pi/pi-mnemopi";
@@ -43,6 +44,7 @@ import {
 	loadMnemopi,
 	loadMnemopiCore,
 	type MnemopiBankStats,
+	type MnemopiRecallSnapshot,
 	MnemopiSessionState,
 	type MnemopiSessionStateApi,
 	requireMnemopi,
@@ -85,24 +87,18 @@ export function resolveMemoryCompletionInput(
 	return { prompt };
 }
 
-/**
- * Installs a session-owned Mnemopi state. `inherited` is the state of a session this
- * one was forked from with its system prompt copied (`/tan`): that prompt already
- * carries the parent's recall, so the fork starts with it delivered instead of
- * recalling again and appending a duplicate block that breaks the shared cache prefix.
- */
+/** Installs session-owned memory and initializes recall from the fork's snapshot, if provided. */
 async function installMnemopiState(
 	session: AgentSession,
 	config: MnemopiBackendConfig,
-	inherited?: MnemopiSessionStateApi,
+	initialRecall?: MnemopiRecallSnapshot,
 ): Promise<MnemopiSessionState> {
 	const state = new MnemopiSessionState({
 		sessionId: session.sessionId,
 		config,
 		session,
-		hasRecalledForFirstTurn: inherited?.hasRecalledForFirstTurn,
+		initialRecall,
 	});
-	state.lastRecallSnippet = inherited?.lastRecallSnippet;
 	const previous = setMnemopiSessionState(session, state);
 	await previous?.dispose();
 	try {
@@ -153,7 +149,7 @@ export const mnemopiBackend: MemoryBackend = {
 				session,
 			);
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
-			await installMnemopiState(session, config, getMnemopiSessionStateFromParent(options));
+			await installMnemopiState(session, config, options.mnemopiRecallSnapshot);
 		} catch (error) {
 			logger.warn("Mnemopi: backend startup failed; memory backend inert.", { error: String(error) });
 		}
@@ -164,7 +160,9 @@ export const mnemopiBackend: MemoryBackend = {
 			const state = getMnemopiSessionState(session);
 			const primary = state?.aliasOf ?? state;
 			const parts = [prompt.render(mnemopiInstructions)];
-			if (primary?.lastRecallSnippet) parts.push(primary.lastRecallSnippet);
+			if (primary?.lastRecallSnippet && allowsAutomaticMnemopiRecall(session?.model)) {
+				parts.push(primary.lastRecallSnippet);
+			}
 			const rendered = parts.join("\n\n").trim();
 			if (!rendered) return undefined;
 			return truncateApproxTokens(rendered, cfgMnemopiInjectionTokenLimit.get(settings));
@@ -172,13 +170,17 @@ export const mnemopiBackend: MemoryBackend = {
 	},
 
 	async beforeAgentStartPrompt(session, promptText, signal): Promise<MemoryPromptPreparation | undefined> {
+		const allowRecall = allowsAutomaticMnemopiRecall(session.model);
 		const state = getMnemopiSessionState(session);
 		const preparation = await state?.beforeAgentStartPrompt(promptText, signal);
 		if (!state || !preparation) return undefined;
 		return {
 			context: preparation.context,
 			notice: preparation.notice,
-			commit: () => getMnemopiSessionState(session) === state && preparation.commit(),
+			commit: () =>
+				allowsAutomaticMnemopiRecall(session.model) === allowRecall &&
+				getMnemopiSessionState(session) === state &&
+				preparation.commit(),
 		};
 	},
 
